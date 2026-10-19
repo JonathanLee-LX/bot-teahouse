@@ -1,0 +1,52 @@
+diff --git a/src/room/hub.ts b/src/room/hub.ts
+index 352aaf1..0076d17 100644
+--- a/src/room/hub.ts
++++ b/src/room/hub.ts
+@@ -274,9 +274,10 @@ export class RoomHub {
+     console.log(`[${room.name}][${fromName}] ${text.slice(0, 300)}${text.length > 300 ? "…" : ""}`);
+     if (this.turnModel) {
+       // 回合制：不广播。消息只存进日志，等轮到各 agent 时随 turn_grant 一并投递。
+-      // 发送者自己的 cursor 照常推进。
+-      const rec = this.workers.get(fromId);
+-      if (rec) rec.cursor[room.id] = msg.seq;
++      // ⚠️ 发送者自己的 cursor 也**不许**在这里推进：推到 msg.seq 会吞掉同一轮里序号更小、
++      //    但发送者从未收到的消息（屏障模型下"我发了第 N 条"≠"我收到了 ≤N 的所有消息"）。
++      //    后果：一轮里越晚发言的人，下一轮收到的越少；最后发言的人下一轮收到**空包**。
++      //    cursor 只由 worker 的 cursor_ack（handleBatch 逐条 ack 投递批次）前移。
+       return msg;
+     }
+     for (const memberId of room.members) {
+@@ -326,9 +327,24 @@ export class RoomHub {
+       members: names,
+     });
+     console.log(`[hub][${room.name}] 第 ${room.round} 轮开始：同时投递给 ${live.length} 人（${names.join("、")}）`);
++    const maxSeq = room.log.reduce((a, m) => Math.max(a, m.seq), 0);
++    const delivered: string[] = [];
+     for (const id of live) {
+       const rec = this.workers.get(id)!;
+-      const batch = room.log.filter((m) => m.seq > (rec.cursor[room.id] ?? 0));
++      const cur = rec.cursor[room.id] ?? 0;
++      const batch = room.log.filter((m) => m.seq > cur);
++      // 落盘形态按定稿：名字=N 条(seq 区间) cursor=旧值 —— 只记条数会把跨轮合批看成一轮
++      const range = batch.length > 0 ? `(#${batch[0].seq}–#${batch[batch.length - 1].seq})` : "(空)";
++      delivered.push(`${this.cards.get(id)?.name ?? id}=${batch.length}${range} cursor=${cur}`);
++      // 可观测的投递缺陷信号：空投递，但日志里明明有该成员未 ack 过的消息。
++      // ⚠️ 只告警、**不改投递**：若"不唤醒"，该成员在屏障里永远不回话，本轮只能等超时/静默收敛
++      //    —— "N=0 不唤醒"必须与"把它按 <skip> 计入本轮屏障"成对实现，只做一半会卡住轮次。
++      if (batch.length === 0 && maxSeq > cur) {
++        console.error(
++          `[hub][${room.name}] ⚠️ 投递可疑：${id} 收到 0 条，但日志 max seq=${maxSeq} > 该成员 cursor=${cur}`
++        );
++        this.transcript.log({ type: "delivery_gap", roomId: room.id, round: room.round, agent: id, maxSeq, cursor: cur });
++      }
+       this.send(rec, {
+         kind: "turn_grant",
+         room: this.roomInfo(room),
+@@ -337,6 +353,7 @@ export class RoomHub {
+         total: live.length,
+       });
+     }
++    console.log(`[hub][${room.name}] 第 ${room.round} 轮投递条数：${delivered.join(" ")}`);
+     this.saveBarrier(room);
+   }
+ 
